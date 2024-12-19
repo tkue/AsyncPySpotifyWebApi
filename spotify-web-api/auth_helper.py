@@ -5,6 +5,8 @@ import requests
 from urllib.parse import urlencode
 import base64
 import webbrowser
+from spotify_auth import write_env_file, EnvFileTypes
+
 
 def load_env():
     for root, subdir, files in walk("."):
@@ -68,5 +70,6 @@ if __name__ == '__main__':
 
     # get code and then give it to the method below
     # get_auth_code()
+    # exit()
 
-    print(get_token("AQAvkOQd54UWU-nmx3X51Wzc8_U2URCwxJ9FxWtOaBYmUT5ptHuE_UHkcqcOryRBidV0AOZp5NAWGapI9ljjTx_F0hYyZNifcx2IEutM51ygisxan3yfFKSZ94M7cuTYpVpAJjY4mdqxFfBidxLpz1KbhnpY7f-mrxZhK50Mxrp2bszmQN99pngKaUFI"))
+    print(get_token("AQCdUmZg0qfuYaiejQrcWCELEHvNCWTYW9qvEYFPQSHKZL2F5lPnC9WDjt30ENeAaw4l7wAmGPyc0zs3-OJkM1CS4GlI8mEIBgbdV0ISpHK0ShbdKBe6o2GL_df129sJtt210DpsOxUpxuocOLlxO6an2rNNntOAm3DoVY51udswP-hKnF_kk78VIggf"))

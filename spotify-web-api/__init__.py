@@ -1,3 +1,3 @@
-from auth_helper import load_env
+from spotify_auth import load_env
 
 load_env()

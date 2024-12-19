@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import time
 from os import environ
 import requests
 import json
@@ -9,16 +10,20 @@ from dataclasses import dataclass, field
 import asyncio
 import aiohttp
 from abc import abstractmethod
-from urllib.parse import urlparse, parse_qs, urlsplit, urlunsplit, urlencode
+from urllib.parse import urlparse, parse_qs, urlsplit, urlunsplit, urlencode, quote
 from requests.models import PreparedRequest, Response
 from auth_helper import load_env
-
+from urllib.parse import urljoin
+from requests_oauthlib import OAuth2Session
 
 import requests
 from urllib.parse import urlencode
 import base64
 import webbrowser
 
+from spotify_auth import write_env_file, EnvFileTypes
+
+# TODO: document/docstrings
 
 class ApiMethodType(Enum):
     GET = 'get'
@@ -96,12 +101,13 @@ class ApiCall:
         parsed_url = urlparse(self.url)
         return parsed_url.path
 
-
+# TODO: Might be good to refactor into it's own package
 class ApiSession(object):
-    def __init__(self, n_workers: int, max_retries: int=0, retry_delay: int=1):
+    def __init__(self, n_workers: int, base_url: str, max_retries: int=0, retry_delay: int=1):
         self.n_workers = n_workers
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self._base_url = base_url
 
     async def _worker(self, queue: asyncio.Queue, session: aiohttp.ClientSession, results: [ApiCall]):
         while True:
@@ -142,6 +148,9 @@ class ApiSession(object):
 
         return results
 
+    def _get_url(self, path: str, *args):
+        return urljoin(self._base_url, path.format(*args))
+
 
     @abstractmethod
     def get_headers(self):
@@ -160,47 +169,62 @@ class SpotifyUrl(Enum):
 class SpotifySession(ApiSession):
     __HEADER_TOKEN = {'Content-Type': 'application/x-www-form-urlencoded'}
     __API_RETURN_ITEM_LIMIT = 50
+    __DEFAULT_SPOTIFY_BASE_URL = 'https://api.spotify.com/v1/'
 
-    def __init__(self, client_id, client_secret, redirect_uri, user_oauth: str, scopes: [SpotifyScopeTypes], limit=20, n_workers: int=1, max_retries: int=0, retry_delay: int=1):
+    def __init__(self, client_id, client_secret, redirect_uri, oauth_access_token_json: str, scopes: [SpotifyScopeTypes], limit=20,
+                 n_workers: int = 1, max_retries: int = 0, retry_delay: int = 1, spotify_base_url: str = None):
         self.__client_id = client_id
         self.__client_secret = client_secret
-        self.__user_oauth = user_oauth
+        self.__oauth_access_token = OauthAccessToken(oauth_access_token_json)
+        self.__user_oauth_access_token_value = self.__oauth_access_token.access_token
         self.__scopes = scopes
         self.__redirect_uri = redirect_uri
+        if spotify_base_url:
+            self.__spotify_base_url = spotify_base_url
+        else:
+            self.__spotify_base_url = SpotifySession.__DEFAULT_SPOTIFY_BASE_URL
 
-        if limit > self.__API_RETURN_ITEM_LIMIT:
+        if limit > SpotifySession.__API_RETURN_ITEM_LIMIT:
             raise ValueError('Limit can be a maximum of {}, but you gave {}'.format(self.__API_RETURN_ITEM_LIMIT, limit))
 
         self.__limit = limit
 
-        super().__init__(n_workers=n_workers, max_retries=max_retries, retry_delay=retry_delay)
+        super().__init__(n_workers=n_workers, base_url=self.__spotify_base_url, max_retries=max_retries, retry_delay=retry_delay)
 
         self.__access_token = None
 
-    def __make_api_call(self, method, url, header, payload=None):
+    def __make_api_call(self, method, url, header, payload=None, token_function=None):
+        is_retry_token = False
+
         r = requests.request(method, url, headers=header, data=payload)
         if r.status_code != 200:
+            if r.status_code == 401 and token_function and not is_retry_token:
+                # TODO: move to base class
+                try:
+                    token_function()
+                    is_retry_token = True
+                    self.__make_api_call(method, url, header, payload, token_function)
+                except:
+                    raise
+
+
             raise requests.RequestException('Failed to make API call. Response code: {0}'.format(r.status_code))
 
         return r
 
     def __get_access_token(self):
+        # TODO: refactor
         url = 'https://accounts.spotify.com/api/token'
-        # FIXME: broken; it did work...
-        # url += '&scope=' + ' '.join([x.value for x in self.__scopes])
-        # print(url)
-        # params = {
-        #     'scope': ' '.join([x.value for x in self.__scopes])
-        # }
 
-        # url = ApiSession.add_params_to_url_request(url=url, params={(k,v) for k, v in params.items() if v is not None})
         header = self.__HEADER_TOKEN
         payload = 'grant_type=client_credentials&client_id={0}&client_secret={1}'.format(self.__client_id, self.__client_secret)
 
         r = self.__make_api_call('POST', url, header, payload)
-        return json.loads(r.text)['access_token']
+        return AccessToken(r)
 
     async def _make_api_calls(self, api_calls: [ApiCall], headers: {}=None, is_get_all: bool=False):
+        # TODO: implement caching - e.g. don't want to make the same call for a song because it is in more than one playlist
+        # TODO: refactor and allow to pass in session
         session = aiohttp.ClientSession(headers=headers)
 
         try:
@@ -241,7 +265,7 @@ class SpotifySession(ApiSession):
     @property
     def access_token(self):
         if not self.__access_token:
-            self.__access_token = self.__get_access_token()
+            self.__access_token = self.__get_access_token().access_token
 
         return self.__access_token
 
@@ -253,13 +277,39 @@ class SpotifySession(ApiSession):
         return {'Authorization': 'Bearer {}'.format(self.access_token)}
 
     def get_headers_oauth(self):
-        return {'Authorization': 'Bearer {}'.format(self.__user_oauth)}
+        return {'Authorization': 'Bearer {}'.
+        format(self.__user_oauth_access_token_value)}
+
+    def __get_oauth_token(self):
+        # TODO: can we make this more seamless or do we always need to user to copy/paste?
+
+        # TODO: refactor URl's
+        authorization_base_url = "https://accounts.spotify.com/authorize"
+        token_url = "https://accounts.spotify.com/api/token"
+
+        scope = [x.value for x in self.__scopes]
+        spotify = OAuth2Session(client_id, scope=scope, redirect_uri=redirect_uri)
+        authorization_url, state = spotify.authorization_url(authorization_base_url)
+        webbrowser.open_new_tab(authorization_url)
+
+        redirect_response = input('\n\nPaste the full redirect URL here: ')
+
+        from requests.auth import HTTPBasicAuth
+        auth = HTTPBasicAuth(self.__client_id, self.__client_secret)
+        token = spotify.fetch_token(token_url, auth=auth,
+                                    authorization_response=redirect_response)
+
+
+        write_env_file(EnvFileTypes.OAUTH_ACCESS_TOKEN_JSON.value, json.dumps(token))
+
+
+        return token
 
     def get_playlists(self, is_get_all=False, user_id: str=None):
         if not user_id:
-            url = 'https://api.spotify.com/v1/users/me/playlists'  # FIXME: refactor and break out URLs
+            url = self._get_url('me/playlists')  # TODO: this one is pretty useless: it seems to give test data...
         else:
-            url = 'https://api.spotify.com/v1/users/{0}/playlists'.format(user_id)
+            url = self._get_url('users/{0}/playlists', user_id)
 
         url = self._add_params_to_url_request(url, offset=0)
         header = self.get_headers()
@@ -271,10 +321,10 @@ class SpotifySession(ApiSession):
                 yield Playlist(item)
 
     def get_user(self):
-        # TODO: Check to see if need new token
-        url = 'https://api.spotify.com/v1/me'
+        # TODO: Check to see if need new token (check expiration)
+        url = self._get_url('me')
         header = self.get_headers_oauth()
-        r = self.__make_api_call(method='get', url=url, header=header)
+        r = self.__make_api_call(method='get', url=url, header=header, token_function=self.__get_oauth_token)
         return User(r.text)
 
 
@@ -289,23 +339,23 @@ class JsonResponse(object):
 
     @property
     def limit(self):
-        return self.response['limit']
+        return self.response.get('limit')
 
     @property
     def total(self):
-        return self.response['total']
+        return self.response.get('total')
 
     @property
     def offset(self):
-        return self.response['offset']
+        return self.response.get('offset')
 
     @property
     def next_href(self):
-        return self.response['next']
+        return self.response.get('next')
 
     @property
     def href(self):
-        return self.response['href']
+        return self.response.get('href')
 
     @property
     def api_url_path(self):
@@ -366,21 +416,58 @@ class JsonResponse(object):
             yield item
 
 
+class AccessToken(JsonResponse):
+    def __init__(self, response):
+        super(AccessToken, self).__init__(response)
+
+    @property
+    def access_token(self):
+        return self.get_json_response()['access_token']
+
+    @property
+    def token_type(self):
+        return self.get_json_response()['token_type']
+
+    @property
+    def expires_in(self):
+        return self.get_json_response()['expires_in']
+
+    def is_token_expired(self):
+        return self.expires_in < time.time()
+
+
+class OauthAccessToken(AccessToken):
+    def __init__(self, response):
+        super(OauthAccessToken, self).__init__(response)
+
+    @property
+    def refresh_token(self):
+        return self.get_json_response()['refresh_token']
+
+    @property
+    def scope(self):
+        return self.get_json_response()['scope']
+
+    @property
+    def expires_at(self):
+        return self.get_json_response()['expires_at']
+
+
 class Playlist(JsonResponse):
     def __init__(self, response):
         super(Playlist, self).__init__(response)
 
     @property
     def name(self):
-        return self.response['name']
+        return self.get_json_response()['name']
 
     @property
     def id(self):
-        return self.response['id']
+        return self.get_json_response()['id']
 
     @property
     def number_of_tracks(self):
-        return self.response['tracks']['total']
+        return self.get_json_response()['tracks']['total']
 
 class User(JsonResponse):
     def __init__(self, response):
@@ -397,6 +484,9 @@ class User(JsonResponse):
 
 if __name__ == '__main__':
 
+
+    # TODO: move to own dir and get rid of this test code
+
     load_env()
 
 
@@ -404,18 +494,26 @@ if __name__ == '__main__':
     client_secret = environ.get('CLIENT_SECRET')
     redirect_uri = environ.get('REDIRECT_URI')
     user_oauth = environ.get('USER_OAUTH')
+    oauth_access_token_json = environ.get('OAUTH_ACCESS_TOKEN_JSON')
+
+    # print(oauth_access_token_json)
+    # exit()
 
     scopes = [SpotifyScopeTypes.PLAYLIST_READ_PRIVATE,
               SpotifyScopeTypes.PLAYLIST_READ_COLLABORATIVE,
               SpotifyScopeTypes.PLAYLIST_MODIFY_PUBLIC,
-              SpotifyScopeTypes.PLAYLIST_MODIFY_PRIVATE,
-              SpotifyScopeTypes.USER_READ_PRIVATE,
-              SpotifyScopeTypes.USER_READ_EMAIL,
-              SpotifyScopeTypes.UGC_IMAGE_UPLOAD
+              SpotifyScopeTypes.PLAYLIST_MODIFY_PRIVATE
+              # SpotifyScopeTypes.USER_READ_PRIVATE,
+              # SpotifyScopeTypes.USER_READ_EMAIL,
+              # SpotifyScopeTypes.UGC_IMAGE_UPLOAD
               ]
 
     session = SpotifySession(client_id=client_id, client_secret=client_secret, redirect_uri=redirect_uri,
-                             user_oauth=user_oauth, scopes=scopes, n_workers=10, limit=20)
+                             oauth_access_token_json=oauth_access_token_json, scopes=scopes, n_workers=10, limit=20)
+
+
+    # session.get_oauth_token()
+    # exit()
 
     user = session.get_user()
     playlists = session.get_playlists(is_get_all=True, user_id=user.id)
